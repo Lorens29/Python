@@ -1,0 +1,125 @@
+import os, datetime
+import pandas as pd
+import numpy as np
+from functions import psql, gsheet, kobo_api
+from itertools import islice
+from kobo import kobo
+
+
+def staging():
+    """
+    This functions takes the raw data and put it in a format the fits our Data Model
+    Change the "historical" value depending on what you want to do
+    If historical = True, we read from the Tananua master dataset on googlesheet
+    If False, we export the new data from KoboToolbox API
+    In any case, evenutally we merge everything toghether into the data model
+    """
+    historical = True
+
+    global df, trip, species_catch, measurements # declare dataframes as global variables (so they can be used in other functions)
+
+    column_map, metadata = kobo.read_map() # this is the map where we match the specific column names, to the global datapoints in the data model
+
+    if historical:
+        # we have a copy of the master dataset saved as it is in the data warehouse
+        master = psql.read('rds', 'staging', 'master_ind_tananua') # read raw master dataset from data warehouse
+        app = 'Tananua_historical' # point the script to the right section of the map
+    else:
+        json = kobo_api.get_json(os.getenv('TANANUA')) # this function (hosted in another script), extracts data from KoboToolbox API
+        app = 'Tananua' # point the script to the right section of the map
+        # The raw data comes in JSON format, so it needs some more structure before mapping
+        for meta in metadata&#91;'column']: # get all metadata data as variables per each app
+            exec("%s = '%s'" % (meta, metadata.loc&#91;metadata&#91;'column']==meta, app].item()), globals())
+        # add measurments keys where not present, otherwise script will fail
+        &#91;elem.update({measurements_key:&#91;]}) for elem in json if measurements_key not in elem.keys()]
+
+        # convert the raw json to the dataframes as in our data model
+        trip = pd.json_normalize(json)
+        measurements = pd.json_normalize(json, measurements_key, &#91;'_uuid'], errors='ignore')
+        master = pd.merge(trip, measurements, on=&#91;'_uuid'], how='outer') 
+        # here we create a copy of the form of the master data, in case we need to merge it back in the googlesheet
+
+    if historical:
+        """
+        historical data has individual fisher names and sex. So, we need to aggregate them to have
+        total fishers in group, men and women
+        """
+        master&#91;'fishers_in_group'] = 0
+        for i, col in enumerate(&#91;'Nama Nelayan', 'Nama Nelayan Lain (1)', 'Nama Nelayan Lain (2)']):
+            # for each one of the fisher  names column, sum if the name is populatedand write to a total column 
+            master&#91;'fisher_{}'.format(i+1)]=np.where(master&#91;col].isna(), 0, 1)
+            master&#91;'fishers_in_group'] += master&#91;'fisher_{}'.format(i+1)]
+        master&#91;'men_in_group'] = np.where(master&#91;'Jenis Kelamin Nelayan']=='Laki-Laki', 1, 0) # in the same way, count men
+        master&#91;'women_in_group'] = np.where(master&#91;'Jenis Kelamin Nelayan']=='Perempuan', 1, 0) # and women
+    else:
+        """
+        kobo data has only information about another fisher. No gender. If there's another fisher, fisher_in_group = 2, otherwise 1
+        """
+        other_fisher = 'group_dk5bb93/Nama_Nelayan_Lain'
+        master&#91;'fishers_in_group'] = np.where(master&#91;other_fisher].isna(), 1, 2)
+
+    df = pd.DataFrame() # initialize empty dataframe to contain final data
+
+    # here we still keep all the column names needed, and granularity still 1 row per octopus
+    # then, we'll get the different levels of aggregation required by our data model
+    for key, row in islice(column_map.iterrows(), 1, 45): # trip ID is null so need to start from second row, hardcoded row number
+        if not(pd.isnull(row&#91;app])): # map all the local column names with the global ones
+            if not(row&#91;app].endswith('_')):
+                df&#91;row&#91;'column']] = master&#91;row&#91;app]]
+            else:
+                df&#91;row&#91;'column']] = row&#91;app]&#91;:-1] # remove last _ and keep the string
+        else:
+            df&#91;row&#91;'column']] = np.nan # if row is empty, keep as None
+
+    if historical:
+        """
+        Kobo data comes with a unique ID per submission, but historical data not.
+        Here we generate a unique identifier for historical data, made of (date + village + fishing_site + fisher + gear + n_octopus + weight)
+        """
+        id_columns = column_map&#91;column_map&#91;'key']==True]&#91;'column'].to_list()
+        df&#91;'trip_id'] = 'IND_TAN_'
+        for col in id_columns:
+            df&#91;'trip_id'] = df&#91;'trip_id']+df&#91;col].astype(str).str.split().str.get(0)+'_'
+        df&#91;'date'] = pd.to_datetime(df&#91;'date'], dayfirst=True, errors='ignore') # parse dates in the correct format
+
+    # as granularity is one row per octopus:
+    df&#91;'n_individuals'] = 1
+    df&#91;'weight'] = df&#91;'weight'].astype(float) # convert to float, app export otherwise not recognized
+    df&#91;'species'] = 'octopus cyanea' # we assume species is always the same
+
+    # now break down in different dataframes according to the data model, still with same granularity of 1 row per octopus
+    for i in &#91;'measurements', 'species_catch', 'trip']:
+        columns = column_map&#91;(column_map&#91;'table']==i)]&#91;'column'].to_list()
+        exec("%s = df&#91;%s]" % (i, columns), globals())
+
+    # Map sex
+    sex = {'betina':'F', 'jantan':'M'}
+    # make sure is lowercase
+    measurements&#91;'sex'] = measurements&#91;'sex'].str.lower()
+    measurements.replace({'sex':sex}, inplace=True)
+
+    species_catch.replace('', 0, inplace=True) # fill missing values in weight, with 0
+    species_catch = species_catch.groupby(&#91;'trip_id']).sum() # species catch is a simple sum of n_individual and weight per trip.
+    species_catch&#91;'sold_fresh'] = species_catch&#91;'weight'] # here we assume it's all sold
+
+
+    trip = trip.astype(str) 
+    trip = trip.groupby(&#91;'trip_id']).max() # in trip, only one column is numerical (weight), so take the max of everything but weight, then merge weight separately (ugly shortcut)
+    # trip and species have same len (unique trip IDs), so we 1:1 merge weight from species
+    trip.drop(columns=&#91;'catch_weight'], inplace=True) # drop catch weight as we already have it
+    trip = pd.merge(trip, species_catch&#91;&#91;'weight']], on='trip_id', how='outer')
+    trip.rename(columns={'weight':'catch_weight'}, inplace=True) # rename as catch weight
+    trip = trip.replace('nan', np.nan) # make sure 'nan' string are converted to nulls
+
+    # make measurements unique by attributing incremental number to measurements of same trip ids
+    measurements&#91;'measurement_id'] = measurements.groupby('trip_id').cumcount()+1
+    measurements.set_index('trip_id', inplace=True)  # set index for performance
+
+    """
+    now that our 3 dataframes are finalized, we can write to the data model
+    """
+    dict = {'trip':trip,'species_catch':species_catch,'measurements':measurements}
+    for key, df in dict.items(): # iterate through 3 dataframes
+        psql.append(df, 'rds', 'staging', 'f_{}'.format(key), index=True)
+        # append means, write at the bottom of the table, then remove any duplicate that may appear
+        # this function is hosted in a separate script
